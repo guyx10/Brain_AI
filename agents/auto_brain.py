@@ -11,11 +11,13 @@ from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
-from integrations.hunter_adapter import (
-    run_hunter_recon,
-    run_hunter_scan,
-    run_hunter_endpoints
-)
+#from integrations.hunter_adapter import (
+#    run_hunter_recon,
+#    run_hunter_scan,
+#    run_hunter_endpoints
+#)
+
+from integrations.hunter_adapter import hunter_run, hunter_results
 
 # ==============================
 # CONFIG
@@ -87,12 +89,8 @@ def search_memory(query: str) -> str:
 
 TOOLS = {
 
-    "hunter_recon": run_hunter_recon,
-
-    "hunter_scan": run_hunter_scan,
-
-    "hunter_endpoints": run_hunter_endpoints,
-
+    "hunter_run": hunter_run,
+    "hunter_results": hunter_results,
     "memory_search": search_memory
 }
 
@@ -104,17 +102,32 @@ TOOLS = {
 def planner(state: BrainState):
 
     prompt = f"""
-You are a planning AI.
+You are a cybersecurity automation planner.
 
-Break the task into small executable steps.
-
-TASK:
+Task:
 {state["task"]}
+
+Available tools:
+
+hunter_run(domain)
+hunter_results(domain)
+memory_search(query)
+
+Workflow:
+
+1 run hunter scan
+2 read hunter results
+3 analyze vulnerabilities
 
 Return JSON list.
 
 Example:
-["step1", "step2"]
+
+[
+ "hunter_run(andurildev.com)",
+ "hunter_results(andurildev.com)",
+ "memory_search(andurildev.com vulnerabilities)"
+]
 """
 
     response = supervisor_model.invoke(prompt)
@@ -134,6 +147,8 @@ Example:
 # EXECUTOR AGENT
 # ==============================
 
+import re
+
 def executor(state: BrainState):
 
     if state["step"] >= len(state["plan"]):
@@ -141,29 +156,50 @@ def executor(state: BrainState):
 
     current_step = state["plan"][state["step"]]
 
+    # ---------------------------------
+    # NEW: detect direct tool call
+    # ---------------------------------
+
+    match = re.search(r'(\w+)\((.*?)\)', current_step)
+
+    if match:
+
+        tool = match.group(1)
+        arg = match.group(2)
+
+        if tool in TOOLS:
+            result = TOOLS[tool](arg)
+        else:
+            result = f"Unknown tool {tool}"
+
+        state["observation"] = result
+        state["history"].append(result)
+
+        return state
+
+    # ---------------------------------
+    # ORIGINAL EXECUTION FLOW
+    # ---------------------------------
+
     memory_context = search_memory(current_step)
 
     prompt = f"""
-You are a security automation agent.
-
-Available tools:
-
-hunter_recon(domain)
-hunter_scan(domain)
-hunter_endpoints(domain)
-memory_search(query)
+You are an execution AI.
 
 Step:
 {current_step}
 
-Respond ONLY in JSON when using tools.
+Memory:
+{memory_context}
 
-Example:
+If you need tools respond in JSON:
 
 {{
- "tool": "hunter_recon",
- "input": "example.com"
+ "tool":"shell",
+ "input":"command"
 }}
+
+Otherwise respond with result text.
 """
 
     response = local_model.invoke(prompt)
@@ -191,7 +227,6 @@ Example:
     state["history"].append(result)
 
     return state
-
 
 # ==============================
 # CRITIC AGENT
