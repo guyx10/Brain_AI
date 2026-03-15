@@ -1,11 +1,8 @@
 import subprocess
-import json
-import os
 
-HUNTER_PATH = "../hunter_v27.1/hunter.py"
+HUNTER_PATH = "...../hunter_v27.1.py"
 
-
-def run_hunter_recon(domain):
+def hunter_run(domain):
 
     cmd = [
         "python",
@@ -13,74 +10,44 @@ def run_hunter_recon(domain):
         "--domain",
         domain,
         "--mode",
-        "recon"
+        "auto"
     ]
 
     try:
-
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600
+            timeout=3600
         )
 
         return result.stdout
 
     except Exception as e:
-
         return str(e)
 
+def hunter_results(domain):
 
-def run_hunter_scan(domain):
+    target_dir = os.path.join(REPORT_DIR, domain)
 
-    cmd = [
-        "python",
-        HUNTER_PATH,
-        "--domain",
-        domain,
-        "--mode",
-        "scan"
+    results = {}
+
+    files = [
+        "endpoints.json",
+        "vulnerabilities.json",
+        "technologies.json"
     ]
 
-    try:
+    for f in files:
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=1200
-        )
+        path = os.path.join(target_dir, f)
 
-        return result.stdout
+        if os.path.exists(path):
 
-    except Exception as e:
+            try:
+                with open(path) as fp:
+                    results[f] = json.load(fp)
+            except:
+                results[f] = "error parsing"
 
-        return str(e)
-
-
-def run_hunter_endpoints(domain):
-
-    cmd = [
-        "python",
-        HUNTER_PATH,
-        "--domain",
-        domain,
-        "--mode",
-        "endpoints"
-    ]
-
-    try:
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600
-        )
-
-        return result.stdout
-
-    except Exception as e:
-
-        return str(e)
+    return json.dumps(results, indent=2)
