@@ -1,9 +1,13 @@
 import os
 import json
 import subprocess
+import re  # <-- CRITICAL: Add this import
 from typing import TypedDict, List, Dict
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# DEBUG: Verify re is imported
+print(f"[DEBUG] re module imported: {re}")
 
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
@@ -11,13 +15,11 @@ from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
-#from integrations.hunter_adapter import (
-#    run_hunter_recon,
-#    run_hunter_scan,
-#    run_hunter_endpoints
-#)
-
-from integrations.hunter_adapter import hunter_run, hunter_results
+from integrations.hunter_adapter import (
+    run_hunter_recon,
+    run_hunter_scan,
+    run_hunter_endpoints
+)
 
 # ==============================
 # CONFIG
@@ -86,21 +88,68 @@ def search_memory(query: str) -> str:
     docs = vector_db.similarity_search(query, k=3)
     return "\n".join([d.page_content for d in docs])
 
+# ==============================
+# HUNTER TOOLS
+# ==============================
+
+def hunter_run(domain: str) -> str:
+    """Run Hunter scan on a domain from its original location"""
+    print(f"[Tool] Running Hunter scan on {domain}")
+    try:
+        # Call the imported hunter function from your adapter
+        result = run_hunter_scan(domain)
+        return result
+    except Exception as e:
+        return f"Error running Hunter: {str(e)}"
+
+def hunter_results(domain: str) -> str:
+    """Get results from a previous Hunter scan"""
+    print(f"[Tool] Fetching Hunter results for {domain}")
+    try:
+        # You could modify this to just fetch results without re-running
+        result = run_hunter_scan(domain)
+        return result
+    except Exception as e:
+        return f"Error fetching Hunter results: {str(e)}"
+
+# ==============================
+# TOOLS DICTIONARY
+# ==============================
 
 TOOLS = {
-
     "hunter_run": hunter_run,
     "hunter_results": hunter_results,
     "memory_search": search_memory
 }
 
 
+def hunter_run(domain: str) -> str:
+    """Run Hunter scan on a domain"""
+    print(f"[Tool] Running Hunter scan on {domain}")
+    try:
+        # Call the imported hunter function
+        result = run_hunter_scan(domain)
+        return result
+    except Exception as e:
+        return f"Error running Hunter: {str(e)}"
+
+def hunter_results(domain: str) -> str:
+    """Get results from a previous Hunter scan"""
+    print(f"[Tool] Fetching Hunter results for {domain}")
+    try:
+        # You could either:
+        # 1. Return the results from memory/cache
+        # 2. Or just run the scan again
+        result = run_hunter_scan(domain)
+        return result
+    except Exception as e:
+        return f"Error fetching Hunter results: {str(e)}"
+
 # ==============================
 # PLANNER AGENT
 # ==============================
 
 def planner(state: BrainState):
-
     prompt = f"""
 You are a cybersecurity automation planner.
 
@@ -109,37 +158,56 @@ Task:
 
 Available tools:
 
-hunter_run(domain)
-hunter_results(domain)
-memory_search(query)
+hunter_run(domain) - Runs a full Hunter v27 security scan on a domain
+hunter_results(domain) - Retrieves results from a Hunter scan
+memory_search(query) - Searches past scan results and knowledge
+shell(command) - Run a shell command
 
-Workflow:
+For domain analysis tasks, follow this workflow:
+1. First run hunter_run() on the target domain
+2. Then use hunter_results() to get the findings
+3. Finally search memory for similar vulnerabilities
 
-1 run hunter scan
-2 read hunter results
-3 analyze vulnerabilities
+Return ONLY a JSON list of tool calls in order.
+Example for "analyze attack surface of anduril.com":
+["hunter_run(anduril.com)", "hunter_results(anduril.com)", "memory_search(anduril.com vulnerabilities)"]
 
-Return JSON list.
-
-Example:
-
-[
- "hunter_run(andurildev.com)",
- "hunter_results(andurildev.com)",
- "memory_search(andurildev.com vulnerabilities)"
-]
+IMPORTANT: Use double quotes (") not single quotes (') in the JSON.
+Return the JSON list now:
 """
 
     response = supervisor_model.invoke(prompt)
 
     try:
-        plan = json.loads(response.content)
-    except:
-        plan = [state["task"]]
+        # Clean the response - remove markdown code blocks if present
+        content = response.content
+        if "```" in content:
+            # Extract JSON from between code blocks
+            content = content.split("```")[1].split("```")[0]
+            if content.startswith("json"):
+                content = content[4:]
+        
+        # Fix: Replace single quotes with double quotes for valid JSON
+        content = content.replace("'", '"')
+        
+        plan = json.loads(content)
+    except Exception as e:
+        print(f"[DEBUG] JSON parsing error: {e}")
+        # Fallback for hunter tasks
+        if "hunter" in state["task"].lower() or "attack" in state["task"].lower():
+            # Extract domain using regex
+            import re
+            domain_match = re.search(r'([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', state["task"])
+            if domain_match:
+                target = domain_match.group(1)
+                plan = [f"hunter_run({target})", f"hunter_results({target})"]
+            else:
+                plan = [state["task"]]
+        else:
+            plan = [state["task"]]
 
     state["plan"] = plan
     state["step"] = 0
-
     return state
 
 
@@ -147,25 +215,28 @@ Example:
 # EXECUTOR AGENT
 # ==============================
 
-import re
-
 def executor(state: BrainState):
-
+    # Import re locally as a fallback
+    import re
+    
     if state["step"] >= len(state["plan"]):
         return state
 
     current_step = state["plan"][state["step"]]
+    print(f"[Executor] Running step: {current_step}")
+    
+    # Debug: Show what we're working with
+    print(f"[DEBUG] Current step type: {type(current_step)}")
+    print(f"[DEBUG] Current step content: {current_step}")
 
-    # ---------------------------------
-    # NEW: detect direct tool call
-    # ---------------------------------
-
+    # Detect direct tool call
     match = re.search(r'(\w+)\((.*?)\)', current_step)
 
     if match:
-
         tool = match.group(1)
-        arg = match.group(2)
+        arg = match.group(2).strip("'\"")
+        
+        print(f"[Executor] Detected tool call: {tool} with arg: {arg}")
 
         if tool in TOOLS:
             result = TOOLS[tool](arg)
@@ -174,13 +245,26 @@ def executor(state: BrainState):
 
         state["observation"] = result
         state["history"].append(result)
+        return state
 
+
+    # ---------------------------------
+    # If it's a raw task like "analyze attack surface of X", try to extract domain
+    # ---------------------------------
+    if "analyze attack surface" in current_step.lower():
+        # Extract domain
+        target = current_step.lower().replace("analyze attack surface of", "").strip()
+        print(f"[Executor] Detected raw task, extracting target: {target}")
+        
+        # Try to run hunter directly
+        result = hunter_run(target)
+        state["observation"] = result
+        state["history"].append(result)
         return state
 
     # ---------------------------------
-    # ORIGINAL EXECUTION FLOW
+    # ORIGINAL EXECUTION FLOW for other cases
     # ---------------------------------
-
     memory_context = search_memory(current_step)
 
     prompt = f"""
@@ -212,12 +296,12 @@ Otherwise respond with result text.
             inp = data["input"]
 
             if tool in TOOLS:
-
                 if isinstance(inp, str):
                     result = TOOLS[tool](inp)
                 else:
                     result = TOOLS[tool](**inp)
-
+            else:
+                result = f"Unknown tool {tool}"
         except:
             result = text
     else:
@@ -340,15 +424,27 @@ def run_autonomous_task(task: str):
 # CLI
 # ==============================
 
+# Add this temporarily at the bottom of auto_brain.py to test
 if __name__ == "__main__":
-
+    # Test the planner directly
+    test_state = BrainState(
+        task="analyze attack surface of anduril.com",
+        plan=[],
+        step=0,
+        observation="",
+        result="",
+        history=[]
+    )
+    
+    print("Testing planner...")
+    result = planner(test_state)
+    print(f"Planner result: {result['plan']}")
+    
+    # Then run the normal loop
     while True:
         task = input("\nBrain_AI task > ")
-
         if task.strip() == "exit":
             break
-
         result = run_autonomous_task(task)
-
         print("\nRESULT:\n")
         print(result)
