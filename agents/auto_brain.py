@@ -1,7 +1,8 @@
+#agent/auto_brain
 import os
 import json
 import subprocess
-import re  # <-- CRITICAL: Add this import
+import re
 from typing import TypedDict, List, Dict
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,11 +16,8 @@ from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
-from integrations.hunter_adapter import (
-    run_hunter_recon,
-    run_hunter_scan,
-    run_hunter_endpoints
-)
+from integrations.hunter_smart_adapter import HUNTER_TOOLS, SmartHunterAdapter
+
 
 # ==============================
 # CONFIG
@@ -47,11 +45,15 @@ class BrainState(TypedDict):
 # MODELS
 # ==============================
 
-local_model = ChatOllama(model=MODEL_LOCAL)
-
-supervisor_model = ChatOllama(
-    model=MODEL_SUPERVISOR,
-    temperature=0
+local_model = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.1,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+supervisor_model = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    api_key=os.getenv("OPENAI_API_KEY"),
 )
 
 
@@ -88,50 +90,12 @@ def search_memory(query: str) -> str:
     docs = vector_db.similarity_search(query, k=3)
     return "\n".join([d.page_content for d in docs])
 
-# ==============================
-# HUNTER TOOLS
-# ==============================
-
-def hunter_run(domain: str) -> str:
-    """Run Hunter scan on a domain from its original location"""
-    print(f"[Tool] Running Hunter scan on {domain}")
-    try:
-        # Call the imported hunter function from your adapter
-        result = run_hunter_scan(domain)
-        return result
-    except Exception as e:
-        return f"Error running Hunter: {str(e)}"
-
-def hunter_results(domain: str) -> str:
-    """Get results from a previous Hunter scan"""
-    print(f"[Tool] Fetching Hunter results for {domain}")
-    try:
-        # You could modify this to just fetch results without re-running
-        result = run_hunter_scan(domain)
-        return result
-    except Exception as e:
-        return f"Error fetching Hunter results: {str(e)}"
-
-# ==============================
-# TOOLS DICTIONARY
-# ==============================
 
 TOOLS = {
-    "hunter_run": hunter_run,
-    "hunter_results": hunter_results,
-    "memory_search": search_memory
+    **HUNTER_TOOLS,
+    "memory_search": search_memory,
+    "shell": run_command,
 }
-
-
-def hunter_run(domain: str) -> str:
-    """Run Hunter scan on a domain"""
-    print(f"[Tool] Running Hunter scan on {domain}")
-    try:
-        # Call the imported hunter function
-        result = run_hunter_scan(domain)
-        return result
-    except Exception as e:
-        return f"Error running Hunter: {str(e)}"
 
 def hunter_results(domain: str) -> str:
     """Get results from a previous Hunter scan"""
@@ -150,32 +114,41 @@ def hunter_results(domain: str) -> str:
 # ==============================
 
 def planner(state: BrainState):
-    prompt = f"""
+    NEW_PLANNER_PROMPT = """
 You are a cybersecurity automation planner.
-
+ 
 Task:
-{state["task"]}
-
+{task}
+ 
 Available tools:
-
-hunter_run(domain) - Runs a full Hunter v27 security scan on a domain
-hunter_results(domain) - Retrieves results from a Hunter scan
-memory_search(query) - Searches past scan results and knowledge
+ 
+hunter_scan(domain) - Run full Hunter v27 security scan (takes 20-40 min)
+hunter_analyze(domain) - AI analysis of scan results with next steps
+hunter_findings(domain) - Get concise findings summary
+hunter_investigate(domain:index) - Deep-dive into finding #index
+hunter_test(domain|url|type) - Run targeted test (sqli, xss, nuclei)
+hunter_report(domain:filename) - Read specific report file
+memory_search(query) - Search past scan results
 shell(command) - Run a shell command
-
-For domain analysis tasks, follow this workflow:
-1. First run hunter_run() on the target domain
-2. Then use hunter_results() to get the findings
-3. Finally search memory for similar vulnerabilities
-
+ 
+WORKFLOW for domain scanning:
+1. hunter_scan(domain) — run the full scan
+2. hunter_analyze(domain) — get AI analysis of results
+3. hunter_investigate(domain:0) — deep-dive top finding
+4. hunter_test(domain|url|type) — verify specific findings
+ 
+WORKFLOW for checking previous results:
+1. hunter_findings(domain) — get summary
+2. hunter_analyze(domain) — get AI recommendations
+ 
 Return ONLY a JSON list of tool calls in order.
-Example for "analyze attack surface of anduril.com":
-["hunter_run(anduril.com)", "hunter_results(anduril.com)", "memory_search(anduril.com vulnerabilities)"]
-
-IMPORTANT: Use double quotes (") not single quotes (') in the JSON.
+Example: ["hunter_scan(demo.testfire.net)", "hunter_analyze(demo.testfire.net)", "hunter_investigate(demo.testfire.net:0)"]
+ 
+IMPORTANT: Use double quotes in JSON.
 Return the JSON list now:
 """
 
+    prompt = NEW_PLANNER_PROMPT.format(task=state["task"])
     response = supervisor_model.invoke(prompt)
 
     try:
@@ -193,19 +166,23 @@ Return the JSON list now:
         plan = json.loads(content)
     except Exception as e:
         print(f"[DEBUG] JSON parsing error: {e}")
-        # Fallback for hunter tasks
-        if "hunter" in state["task"].lower() or "attack" in state["task"].lower():
-            # Extract domain using regex
-            import re
-            domain_match = re.search(r'([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', state["task"])
+        if any(kw in state["task"].lower() for kw in ["hunter", "attack", "scan", "analyze", "test", "pentest", "recon", "findings", "investigate"]) or re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', state["task"]):
+            domain_match = re.search(r'([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', state["task"])
             if domain_match:
                 target = domain_match.group(1)
-                plan = [f"hunter_run({target})", f"hunter_results({target})"]
+                task_lower = state["task"].lower()
+                if any(kw in task_lower for kw in ["analyze", "findings", "results", "report"]):
+                    plan = [f"hunter_findings({target})", f"hunter_analyze({target})"]
+                elif "investigate" in task_lower:
+                    idx_match = re.search(r'finding\s*(\d+)', task_lower)
+                    idx = idx_match.group(1) if idx_match else "0"
+                    plan = [f"hunter_investigate({target}:{idx})"]
+                else:
+                    plan = [f"hunter_scan({target})", f"hunter_analyze({target})", f"hunter_investigate({target}:0)"]
             else:
                 plan = [state["task"]]
         else:
             plan = [state["task"]]
-
     state["plan"] = plan
     state["step"] = 0
     return state
@@ -257,7 +234,7 @@ def executor(state: BrainState):
         print(f"[Executor] Detected raw task, extracting target: {target}")
         
         # Try to run hunter directly
-        result = hunter_run(target)
+        result = TOOLS["hunter_scan"](target)
         state["observation"] = result
         state["history"].append(result)
         return state
@@ -406,6 +383,9 @@ def run_autonomous_task(task: str):
     result = graph.invoke(state)
 
     final_result = result["result"]
+    if not final_result:
+        # Fallback: use last observation if result is empty
+        final_result = result.get("observation", "") or (result["history"][-1] if result["history"] else "No result")
 
     improved_plan = learning_cycle(
         task,
